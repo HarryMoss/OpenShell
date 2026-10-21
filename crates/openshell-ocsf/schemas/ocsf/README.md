@@ -22,13 +22,13 @@ for offline test validation.
 - `authentication` [3002]
 - `base_event` [0]
 
-### Objects (25)
+### Objects (26)
 
 - `metadata`, `network_endpoint`, `network_proxy`, `process`, `actor`
 - `device`, `container`, `product`, `firewall_rule`, `finding_info`
 - `evidences`, `http_request`, `http_response`, `url`, `attack`
 - `remediation`, `connection_info`, `ai_model`, `api`, `user`, `service`, `os`
-- `trace`, `span`, `key_value_object`
+- `resource_details`, `trace`, `span`, `key_value_object`
 
 ### Profiles (2)
 
@@ -58,7 +58,7 @@ done
 for object in metadata network_endpoint network_proxy process actor device \
               container product firewall_rule finding_info evidences \
               http_request http_response url attack remediation connection_info \
-              ai_model api user service os trace span key_value_object; do
+              ai_model api user service os resource_details trace span key_value_object; do
   curl -s "https://schema.ocsf.io/api/${VERSION}/objects/${object}" \
     | python3 -m json.tool > "objects/${object}.json"
 done
