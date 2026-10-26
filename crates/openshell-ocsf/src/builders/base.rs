@@ -3,14 +3,14 @@
 
 //! Builder for Base Event [0].
 
-use crate::builders::EventContext;
+use crate::builders::ContextRef;
 use crate::enums::{SeverityId, StatusId};
 use crate::events::base_event::BaseEventData;
 use crate::events::{BaseEvent, OcsfEvent};
 
 /// Builder for Base Event [0] — events without a specific OCSF class.
 pub struct BaseEventBuilder<'a> {
-    ctx: &'a EventContext,
+    ctx: ContextRef<'a>,
     trace: Option<crate::TraceCorrelation>,
     severity: SeverityId,
     status: Option<StatusId>,
@@ -28,9 +28,9 @@ impl<'a> BaseEventBuilder<'a> {
     }
 
     #[must_use]
-    pub fn new(ctx: &'a EventContext) -> Self {
+    pub fn new(ctx: impl Into<ContextRef<'a>>) -> Self {
         Self {
-            ctx,
+            ctx: ctx.into(),
             trace: None,
             severity: SeverityId::Informational,
             status: None,

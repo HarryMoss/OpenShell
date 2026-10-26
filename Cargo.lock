@@ -1492,9 +1492,9 @@ dependencies = [
 
 [[package]]
 name = "ctutils"
-version = "0.4.2"
+version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d5515a3834141de9eafb9717ad39eea8247b5674e6066c404e8c4b365d2a29e"
+checksum = "12218662ccac37d9714f2191252553d67585b97df8c839cbe49e0bde278dc865"
 dependencies = [
  "cmov",
  "subtle",
@@ -4346,11 +4346,8 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
- "tokio-rustls",
  "tokio-stream",
- "tokio-tungstenite 0.26.2",
  "tonic",
- "tower",
  "tracing",
  "tracing-subscriber",
  "url",
@@ -4508,16 +4505,19 @@ dependencies = [
  "openshell-otel-test-support",
  "openshell-policy",
  "openshell-sandbox-backend",
+ "openshell-supervisor-control",
  "opentelemetry",
  "opentelemetry_sdk",
  "prost",
  "prost-types",
  "rcgen",
+ "rustls",
  "serde",
  "serde_json",
  "temp-env",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "toml",
  "tonic",
@@ -5031,6 +5031,7 @@ dependencies = [
  "openshell-policy",
  "openshell-prover",
  "openshell-providers",
+ "openshell-supervisor-control",
  "openshell-supervisor-middleware",
  "openshell-supervisor-middleware-builtins",
  "opentelemetry",
@@ -5081,20 +5082,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "openshell-server-macros"
-version = "0.0.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
 name = "openshell-supervisor"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "clap",
  "futures",
+ "http 1.4.0",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "miette",
  "nix 0.29.0",
  "openshell-core",
@@ -5105,6 +5102,7 @@ dependencies = [
  "openshell-otel",
  "openshell-policy",
  "openshell-sandbox-backend",
+ "openshell-supervisor-control",
  "openshell-supervisor-middleware",
  "openshell-supervisor-middleware-builtins",
  "openshell-supervisor-network",
@@ -5121,6 +5119,8 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-rustls",
+ "tokio-stream",
  "tokio-tungstenite 0.26.2",
  "tonic",
  "tonic-prost",
@@ -5128,6 +5128,23 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "openshell-supervisor-control"
+version = "0.0.0"
+dependencies = [
+ "openshell-core",
+ "openshell-otel",
+ "openshell-sandbox-backend",
+ "prost-types",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
 ]
 
 [[package]]
@@ -6938,9 +6955,9 @@ checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.15"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -8988,18 +9005,18 @@ dependencies = [
 
 [[package]]
 name = "webpki-root-certs"
-version = "1.0.7"
+version = "1.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f31141ce3fc3e300ae89b78c0dd67f9708061d1d2eda54b8209346fd6be9a92c"
+checksum = "58ec80e73fd8baf57bf0d9615554c75348bda990d6d5bbeab964dd068319fecb"
 dependencies = [
  "rustls-pki-types",
 ]
 
 [[package]]
 name = "webpki-roots"
-version = "1.0.7"
+version = "1.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52f5ee44c96cf55f1b349600768e3ece3a8f26010c05265ab73f945bb1a2eb9d"
+checksum = "1c1c8e20c8a38fc7d65abfe74eb7280e4aa667e8eec8bc84996d2874810748d9"
 dependencies = [
  "rustls-pki-types",
 ]

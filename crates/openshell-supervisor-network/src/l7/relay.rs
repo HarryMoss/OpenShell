@@ -1748,7 +1748,7 @@ pub(crate) async fn websocket_middleware_preflight(
     let requested_subprotocols =
         crate::l7::rest::websocket_requested_subprotocols(&req.raw_header[..header_end])?;
     let input = websocket_preflight_input(
-        openshell_ocsf::ctx::ctx(),
+        &openshell_ocsf::ctx::ctx(),
         ctx,
         req,
         scheme,
@@ -7627,7 +7627,7 @@ network_policies:
         };
 
         let input = middleware_request_input(
-            openshell_ocsf::ctx::ctx(),
+            &openshell_ocsf::ctx::ctx(),
             "http",
             &req,
             &ctx,
