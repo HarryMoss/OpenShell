@@ -1,7 +1,8 @@
 # Vendored OCSF Schemas
 
 These schemas are vendored from the [OCSF Schema Server](https://schema.ocsf.io/)
-for offline test validation.
+for offline test validation, with the OpenShell Trace-profile applicability
+extension described below.
 
 ## Version
 
@@ -34,12 +35,21 @@ for offline test validation.
 
 - `ai_operation`, `trace`
 
-All ten classes include the `trace` attribute from the OCSF 1.8.0 Trace
-profile, with `profiles: ["trace"]`. HTTP and API Activity include it by default;
-the other class schemas add it for offline validation of automatically
-correlated events. The attribute is recommended, not required. The `trace`,
-`span`, `service`, and `key_value_object` schemas are vendored unchanged.
-Events contain only `trace.uid`.
+Official OCSF 1.8.0 includes the Trace profile on
+[HTTP Activity](https://github.com/ocsf/ocsf-schema/blob/v1.8.0/events/network/http_activity.json)
+and [API Activity](https://github.com/ocsf/ocsf-schema/blob/v1.8.0/events/application/api_activity.json).
+OpenShell extends this optional profile to `network_activity`,
+`detection_finding`, `authentication`, `base_event`, `ssh_activity`,
+`process_activity`, `application_lifecycle`, and `device_config_state_change`.
+All ten vendored class schemas therefore include the profile's `trace` attribute
+and list `trace` in `profiles`.
+
+This is an OpenShell extension beyond official 1.8.0 profile applicability.
+Validation against this catalog checks that extension, not conformance with
+unmodified official class definitions. Consumers that enforce official profile
+applicability may reject correlated records from the eight additional classes.
+The attribute is recommended, not required. The `trace`, `span`, `service`, and
+`key_value_object` schemas are vendored unchanged. Events contain only `trace.uid`.
 
 ## Updating
 

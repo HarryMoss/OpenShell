@@ -67,6 +67,8 @@ pub async fn exported(
 }
 
 pub fn assert_deny_resolves(events: &[serde_json::Value], received: &ReceivedTraces, root: bool) {
+    use opentelemetry_proto::tonic::common::v1::any_value::Value;
+
     assert!(!events.is_empty());
     for event in events {
         let uid = event["trace"]["uid"]
@@ -105,6 +107,186 @@ pub fn assert_deny_resolves(events: &[serde_json::Value], received: &ReceivedTra
             .collect::<Vec<_>>();
         for key in ["openshell.policy.decision", "ocsf.class_uid"] {
             assert!(attributes.contains(&key), "deny span carries {key}");
+        }
+        let class_uid = span
+            .attributes
+            .iter()
+            .find(|attribute| attribute.key == "ocsf.class_uid")
+            .and_then(|attribute| attribute.value.as_ref()?.value.as_ref());
+        assert!(
+            matches!(class_uid, Some(Value::IntValue(_))),
+            "deny span exports ocsf.class_uid as an integer: {class_uid:?}"
+        );
+    }
+}
+
+pub fn assert_deny_attribute(received: &ReceivedTraces, key: &str, expected: &str) {
+    use opentelemetry_proto::tonic::common::v1::any_value::Value;
+    let deny = received
+        .spans
+        .iter()
+        .find(|span| span.name == "supervisor.egress.deny")
+        .unwrap();
+    let attribute = deny
+        .attributes
+        .iter()
+        .find(|attribute| attribute.key == key)
+        .unwrap();
+    assert_eq!(
+        attribute.value.as_ref().unwrap().value.as_ref().unwrap(),
+        &Value::StringValue(expected.to_string())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn companion_emissions_reuse_an_active_decision_scope() {
+    let (events, received) = exported("warn", || {
+        let event = openshell_ocsf::NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+            .action(openshell_ocsf::ActionId::Denied)
+            .dst_endpoint(openshell_ocsf::Endpoint::from_domain(
+                "blocked.example",
+                443,
+            ))
+            .build();
+        let finding =
+            openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx()).build();
+        let scope = super::deny_span(&event, None);
+        scope.in_scope(|| {
+            super::emit(event, None, false);
+            super::emit(finding, None, true);
+        });
+    })
+    .await;
+    assert_eq!(events.len(), 2);
+    assert_eq!(received.spans.len(), 1);
+    assert_eq!(events[0]["trace"]["uid"], events[1]["trace"]["uid"]);
+    assert_deny_resolves(&events, &received, true);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_decisions_keep_companions_and_request_contexts_separate() {
+    for level in ["warn", "debug"] {
+        let (events, received) = exported(level, || {
+            let dispatch = tracing::dispatcher::get_default(Clone::clone);
+            let barrier = std::sync::Barrier::new(2);
+            std::thread::scope(|threads| {
+                for host in ["alpha.example", "beta.example"] {
+                    let dispatch = &dispatch;
+                    let barrier = &barrier;
+                    threads.spawn(move || {
+                        tracing::dispatcher::with_default(dispatch, || {
+                            let outside = openshell_ocsf::ctx::ctx().sandbox_id.clone();
+                            let mut context = (*openshell_ocsf::ctx::ctx()).clone();
+                            context.sandbox_id = host.to_string();
+                            context.sandbox_name = format!("sandbox-{host}");
+                            openshell_ocsf::ctx::bind_thread_ctx(Some(Arc::new(context)));
+                            let connect = tracing::debug_span!("supervisor.egress.connect");
+                            connect.in_scope(|| {
+                                for attempt in 0..2 {
+                                    let decision = format!("{host}:{attempt}");
+                                    let event = openshell_ocsf::NetworkActivityBuilder::new(
+                                        openshell_ocsf::ctx::ctx(),
+                                    )
+                                    .action(openshell_ocsf::ActionId::Denied)
+                                    .dst_endpoint(openshell_ocsf::Endpoint::from_domain(host, 443))
+                                    .status_detail(&decision)
+                                    .message(&decision)
+                                    .build();
+                                    let finding = openshell_ocsf::DetectionFindingBuilder::new(
+                                        openshell_ocsf::ctx::ctx(),
+                                    )
+                                    .message(&decision)
+                                    .build();
+                                    let scope = super::deny_span(&event, None);
+                                    scope.in_scope(|| {
+                                        super::emit(event, None, false);
+                                        // Both threads keep different deny scopes entered
+                                        // while their companion records interleave.
+                                        barrier.wait();
+                                        super::emit(finding, None, true);
+                                        barrier.wait();
+                                    });
+                                }
+                            });
+                            openshell_ocsf::ctx::bind_thread_ctx(None);
+                            assert_eq!(openshell_ocsf::ctx::ctx().sandbox_id, outside);
+                        });
+                    });
+                }
+            });
+        })
+        .await;
+
+        assert_eq!(events.len(), 8);
+        assert_deny_resolves(&events, &received, level == "warn");
+        let denies = received
+            .spans
+            .iter()
+            .filter(|span| span.name == "supervisor.egress.deny")
+            .collect::<Vec<_>>();
+        assert_eq!(denies.len(), 4);
+        assert_eq!(received.spans.len(), if level == "debug" { 6 } else { 4 });
+        let attribute = |span: &opentelemetry_proto::tonic::trace::v1::Span, key: &str| {
+            use opentelemetry_proto::tonic::common::v1::any_value::Value;
+            match span
+                .attributes
+                .iter()
+                .find(|attribute| attribute.key == key)
+                .and_then(|attribute| attribute.value.as_ref())
+                .and_then(|value| value.value.as_ref())
+            {
+                Some(Value::StringValue(value)) => value.clone(),
+                other => panic!("expected string attribute {key}, got {other:?}"),
+            }
+        };
+        let mut traces_by_host = Vec::new();
+        for host in ["alpha.example", "beta.example"] {
+            let mut traces = Vec::new();
+            for attempt in 0..2 {
+                let decision = format!("{host}:{attempt}");
+                let pair = events
+                    .iter()
+                    .filter(|event| event["message"] == decision)
+                    .collect::<Vec<_>>();
+                assert_eq!(pair.len(), 2);
+                for event in &pair {
+                    assert_eq!(event["container"]["uid"], host);
+                    assert_eq!(event["container"]["name"], format!("sandbox-{host}"));
+                }
+                assert_eq!(pair[0]["trace"]["uid"], pair[1]["trace"]["uid"]);
+                let spans = denies
+                    .iter()
+                    .filter(|span| attribute(span, "openshell.policy.reason") == decision)
+                    .collect::<Vec<_>>();
+                assert_eq!(spans.len(), 1);
+                let deny = spans[0];
+                assert_eq!(attribute(deny, "server.address"), host);
+                assert_eq!(pair[0]["trace"]["uid"], hex::encode(&deny.trace_id));
+                if level == "debug" {
+                    let connect = received
+                        .spans
+                        .iter()
+                        .find(|span| span.span_id == deny.parent_span_id)
+                        .unwrap();
+                    assert_eq!(connect.name, "supervisor.egress.connect");
+                    assert_eq!(connect.trace_id, deny.trace_id);
+                }
+                traces.push(deny.trace_id.clone());
+            }
+            if level == "debug" {
+                assert_eq!(traces[0], traces[1]);
+            } else {
+                assert_ne!(traces[0], traces[1]);
+            }
+            traces_by_host.push(traces);
+        }
+        for alpha in &traces_by_host[0] {
+            for beta in &traces_by_host[1] {
+                assert_ne!(
+                    alpha, beta,
+                    "independent request contexts must stay separate"
+                );
+            }
         }
     }
 }

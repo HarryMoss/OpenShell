@@ -512,7 +512,7 @@ fn main() -> Result<()> {
                 otlp_layer_provider
                     .as_ref()
                     .map(|provider| openshell_otel::layer(provider, SERVICE_NAME))
-                    .with_filter(otlp_span_filter(&args.log_level)),
+                    .with_filter(openshell_otel::supervisor_span_filter(&args.log_level)),
             )
             .init();
         if !file_available {
@@ -697,12 +697,6 @@ fn supervisor_resource_attributes(
         .collect()
 }
 
-/// A more verbose log level raises `openshell*` spans; dependency spans stay at
-/// INFO so they do not flood the exporter queue.
-fn otlp_span_filter(log_level: &str) -> EnvFilter {
-    openshell_otel::supervisor_span_filter(log_level)
-}
-
 /// Choose the supervisor's exit status for a sandbox run.
 ///
 /// The reserved status tells the compute driver that the sandbox rejected the
@@ -807,7 +801,8 @@ mod tests {
 
     #[test]
     fn otlp_span_filter_raises_only_openshell_targets() {
-        let directives = |log_level: &str| otlp_span_filter(log_level).to_string();
+        let directives =
+            |log_level: &str| openshell_otel::supervisor_span_filter(log_level).to_string();
         assert_eq!(directives("warn"), "openshell=info,info");
         assert_eq!(directives("info"), "openshell=info,info");
         assert_eq!(directives("debug"), "openshell=debug,info");

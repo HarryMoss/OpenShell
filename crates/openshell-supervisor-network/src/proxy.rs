@@ -21,7 +21,7 @@ use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard};
 use crate::policy_dns::PolicyEndpointId;
 use crate::policy_dns::{MappingLookup, MappingLookupError, ResolvedEndpointStore};
 use crate::policy_local::{POLICY_LOCAL_HOST, PolicyLocalContext};
-use crate::telemetry::ocsf_emit;
+use crate::telemetry::egress_emit;
 use crate::upstream_proxy::{self, UpstreamProxyConfig};
 use futures::{FutureExt as _, StreamExt as _, stream::FuturesUnordered};
 use http::StatusCode;
@@ -201,14 +201,13 @@ fn build_credential_endpoint_mismatch_event(
 
 fn emit_credential_endpoint_mismatch(method: &str, host: &str, port: u16, policy_name: &str) {
     let event = build_credential_endpoint_mismatch_event(method, host, port, policy_name);
-    ocsf_emit!(event);
     let finding = crate::l7::build_credential_endpoint_mismatch_finding(
         policy_name,
         host,
         None,
         "Provider credential endpoint binding mismatch; request denied",
     );
-    ocsf_emit!(finding);
+    crate::telemetry::emit_decision([event, finding], None, false);
 }
 
 /// Hostnames injected by compute drivers as `/etc/hosts` aliases for the host
@@ -303,7 +302,7 @@ impl ProxyHandle {
                     format!("Proxy listening on {local_addr}")
                 })
                 .build();
-            ocsf_emit!(event);
+            egress_emit!(event);
         }
 
         // Detect the trusted host gateway IP from /etc/hosts before user code
@@ -344,7 +343,7 @@ impl ProxyHandle {
                              refusing to start: {err}"
                         ))
                         .build();
-                ocsf_emit!(event);
+                egress_emit!(event);
                 miette::miette!("invalid upstream corporate proxy configuration: {err}")
             })?,
         );
@@ -358,7 +357,7 @@ impl ProxyHandle {
                     cfg.summary()
                 ))
                 .build();
-            ocsf_emit!(event);
+            egress_emit!(event);
         }
 
         let (exited_tx, exited_rx) = tokio::sync::oneshot::channel::<()>();
@@ -526,7 +525,7 @@ impl ProxyHandle {
                             )
                             .await
                             {
-                                ocsf_emit!(build_proxy_connection_error_event(
+                                egress_emit!(build_proxy_connection_error_event(
                                     peer_addr,
                                     transparent_destination_addr,
                                     format!("Proxy connection error: {err}"),
@@ -535,7 +534,7 @@ impl ProxyHandle {
                         });
                     }
                     Err(ProxyAcceptError::Source(err)) => {
-                        ocsf_emit!(build_mediation_lane_failure_event(format!(
+                        egress_emit!(build_mediation_lane_failure_event(format!(
                             "Network-mediation source failed; proxy accept loop exiting: {err}"
                         )));
                         break;
@@ -546,7 +545,7 @@ impl ProxyHandle {
                             &mut consecutive_resource_errors,
                             &mut consecutive_unknown_errors,
                         );
-                        ocsf_emit!(build_accept_error_event(local_addr, &err, &action));
+                        egress_emit!(build_accept_error_event(local_addr, &err, &action));
                         match action {
                             AcceptAction::Terminal => break,
                             AcceptAction::Retry { backoff, .. } => {
@@ -861,7 +860,7 @@ fn emit_staged_transparent_denial(
     reason: &str,
     status_detail: &'static str,
 ) {
-    ocsf_emit!(optional_parent: parent, build_staged_transparent_denial_event(
+    egress_emit!(optional_deny_parent: parent, build_staged_transparent_denial_event(
         destination,
         mapped_host,
         identity,
@@ -1073,7 +1072,7 @@ impl TransparentTcpHandle {
                         )
                         .await
                         {
-                            ocsf_emit!(build_connection_error_event(
+                            egress_emit!(build_connection_error_event(
                                 peer_addr,
                                 format!("Transparent TCP connection error: {error}")
                             ));
@@ -1258,7 +1257,9 @@ async fn handle_transparent_tcp_connection(
     );
     let middleware_gate = middleware_uninspectable_gate(&opa_engine, &ctx)?;
     if middleware_gate == crate::l7::middleware::UninspectableTrafficGate::Deny {
-        crate::l7::middleware::emit_middleware_uninspectable(&ctx, "transparent tcp", true);
+        connect_span.in_scope(|| {
+            crate::l7::middleware::emit_middleware_uninspectable(&ctx, "transparent tcp", true);
+        });
         return Ok(());
     }
     if middleware_gate == crate::l7::middleware::UninspectableTrafficGate::BypassWithFinding {
@@ -1317,7 +1318,7 @@ async fn handle_transparent_tcp_connection(
         .binary_pid
         .map_or_else(|| "-".to_string(), |pid| pid.to_string());
     drop(connect_span);
-    ocsf_emit!(build_transparent_tcp_allow_ocsf_event(
+    egress_emit!(build_transparent_tcp_allow_ocsf_event(
         TransparentTcpAllowAudit {
             workload: workload_addr,
             synthetic_destination: original,
@@ -1462,7 +1463,7 @@ fn emit_transparent_mapping_denial(
         | MappingLookupError::InvalidMapping
         | MappingLookupError::LockPoisoned => "transparent_tcp_destination_denied",
     };
-    ocsf_emit!(optional_parent: parent,
+    egress_emit!(optional_deny_parent: parent,
         NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
             .activity(ActivityId::Open)
             .action(ActionId::Denied)
@@ -1497,7 +1498,7 @@ fn emit_transparent_policy_denial(
     let pid = decision
         .binary_pid
         .map_or_else(|| "-".to_string(), |pid| pid.to_string());
-    ocsf_emit!(parent: parent,
+    egress_emit!(deny_parent: parent,
         NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
             .activity(ActivityId::Open)
             .action(ActionId::Denied)
@@ -1969,6 +1970,62 @@ fn build_forward_allow_ocsf_event(
         .build()
 }
 
+fn build_forward_rejection_event(
+    host: &str,
+    port: u16,
+    message: String,
+) -> openshell_ocsf::OcsfEvent {
+    NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Fail)
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Blocked)
+        .severity(SeverityId::Medium)
+        .status(StatusId::Failure)
+        .dst_endpoint(Endpoint::from_domain(host, port))
+        .message(message)
+        .build()
+}
+
+fn build_forward_l7_evaluation_error(
+    host: &str,
+    port: u16,
+    enforcement: crate::l7::EnforcementMode,
+    error: &str,
+) -> openshell_ocsf::OcsfEvent {
+    let enforced = enforcement == crate::l7::EnforcementMode::Enforce;
+    NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Fail)
+        .action(if enforced {
+            ActionId::Denied
+        } else {
+            ActionId::Other
+        })
+        .disposition(if enforced {
+            DispositionId::Blocked
+        } else {
+            DispositionId::Allowed
+        })
+        .severity(SeverityId::Low)
+        .status(StatusId::Failure)
+        .dst_endpoint(Endpoint::from_domain(host, port))
+        .message(format!("L7 evaluation failed: {error}"))
+        .build()
+}
+
+fn emit_forward_l7_decision(
+    decision: openshell_ocsf::OcsfEvent,
+    evaluation_error: Option<openshell_ocsf::OcsfEvent>,
+    connect_span: &tracing::Span,
+) {
+    // The HTTP decision carries policy context that its evaluation-error
+    // companion lacks, so it must supply the shared deny span's attributes.
+    crate::telemetry::emit_decision(
+        std::iter::once(decision).chain(evaluation_error),
+        Some(connect_span),
+        false,
+    );
+}
+
 fn build_forward_parse_error_ocsf_event(
     peer_addr: Option<SocketAddr>,
     method: &str,
@@ -1983,6 +2040,8 @@ fn build_forward_parse_error_ocsf_event(
         .http_response(HttpResponse {
             code: StatusCode::BAD_REQUEST.as_u16(),
         })
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Blocked)
         .severity(SeverityId::Low)
         .status(StatusId::Failure)
         .message(format!("FORWARD parse error for {path}"));
@@ -2228,7 +2287,7 @@ where
     C: TokioAsyncWrite + Unpin,
 {
     let detail = destination_denial_detail(denial.kind);
-    ocsf_emit!(parent: connect_span, build_connect_destination_deny_ocsf_event(
+    egress_emit!(deny_parent: connect_span, build_connect_destination_deny_ocsf_event(
         denial, peer_addr, host, port, binary, pid, ancestors, cmdline,
     ));
 
@@ -2281,7 +2340,7 @@ where
     C: TokioAsyncWrite + Unpin,
 {
     let detail = destination_denial_detail(denial.kind);
-    ocsf_emit!(parent: connect_span, build_forward_destination_deny_ocsf_event(
+    egress_emit!(deny_parent: connect_span, build_forward_destination_deny_ocsf_event(
         denial, peer_addr, method, host, port, path, binary, pid, ancestors, cmdline, policy,
     ));
 
@@ -2740,7 +2799,7 @@ async fn handle_mediated_connection(
             .message(format!("CONNECT denied {host_lc}:{port}"))
             .status_detail(&deny_reason)
             .build();
-        ocsf_emit!(parent: &connect_span, event);
+        egress_emit!(deny_parent: &connect_span, event);
         emit_denial(
             &denial_tx,
             &host_lc,
@@ -2907,7 +2966,7 @@ async fn handle_mediated_connection(
             ))
             .status_detail(TLS_TERMINATION_UNAVAILABLE_DETAIL)
             .build();
-        ocsf_emit!(parent: &connect_span, event);
+        egress_emit!(deny_parent: &connect_span, event);
         emit_activity_simple(activity_tx.as_ref(), true, "tls_termination_unavailable");
         emit_denial(
             &denial_tx,
@@ -2945,12 +3004,12 @@ async fn handle_mediated_connection(
             ))
             .status_detail(DETAIL)
             .build();
-        ocsf_emit!(parent: &connect_span, event);
-        crate::l7::emit_uninspected_credential_finding(
+        let finding = crate::l7::build_uninspected_credential_finding(
             &host_lc,
             policy_str,
             if effective_tls_skip { "tls-skip" } else { "l4" },
         );
+        crate::telemetry::emit_decision([event, finding], Some(&connect_span), false);
         emit_activity_simple(activity_tx.as_ref(), true, "uninspected_credentials");
         emit_denial(
             &denial_tx,
@@ -3027,7 +3086,7 @@ async fn handle_mediated_connection(
 
     // Log the allowed CONNECT — use CONNECT_L7 when L7 inspection follows,
     // so log consumers can distinguish L4-only decisions from tunnel lifecycle events.
-    ocsf_emit!(build_connect_allow_ocsf_event(
+    egress_emit!(build_connect_allow_ocsf_event(
         workload_addr,
         &host_lc,
         port,
@@ -3138,7 +3197,7 @@ async fn handle_mediated_connection(
                         .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                         .message("Upstream TLS establishment failed")
                         .build();
-                    ocsf_emit!(event);
+                    egress_emit!(event);
                     return Err(error);
                 }
             };
@@ -3167,7 +3226,7 @@ async fn handle_mediated_connection(
                         .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                         .message(format!("TLS relay error: {e}"))
                         .build();
-                    ocsf_emit!(event);
+                    egress_emit!(event);
                 }
             }
         } else {
@@ -3199,7 +3258,7 @@ async fn handle_mediated_connection(
                 .message(format!("CONNECT refused for {host_lc}:{port}: {DETAIL}"))
                 .status_detail(DETAIL)
                 .build();
-            ocsf_emit!(event);
+            egress_emit!(event);
             emit_activity_simple(activity_tx.as_ref(), true, "tls_termination_unavailable");
             emit_denial(
                 &denial_tx,
@@ -3242,7 +3301,7 @@ async fn handle_mediated_connection(
                     .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                     .message(message)
                     .build();
-                ocsf_emit!(event);
+                egress_emit!(event);
             }
         }
     } else {
@@ -3272,7 +3331,7 @@ async fn handle_mediated_connection(
                 ))
                 .status_detail(protocol_detail)
                 .build();
-            ocsf_emit!(event);
+            egress_emit!(event);
             emit_activity_simple(activity_tx.as_ref(), true, "l7_parse_rejection");
             emit_denial(
                 &denial_tx,
@@ -3873,7 +3932,7 @@ fn emit_l7_tunnel_close_after_policy_change(host: &str, port: u16, error: miette
             "L7 tunnel closed before inspection because policy changed: {error}"
         ))
         .build();
-    ocsf_emit!(event);
+    egress_emit!(event);
 }
 
 async fn reject_stale_connect_policy<C>(
@@ -4715,7 +4774,7 @@ fn parse_allowed_ips(raw: &[String]) -> std::result::Result<Vec<ipnet::IpNet>, S
                             n.prefix_len()
                         ))
                         .build();
-                    ocsf_emit!(event);
+                    egress_emit!(event);
                 }
                 nets.push(n);
             }
@@ -5389,7 +5448,7 @@ async fn handle_forward_proxy(
     // canonicalized below before credential binding, policy-path evaluation,
     // upstream bytes, or telemetry consume it.
     let Ok((scheme, host, port, mut path)) = parse_proxy_uri(target_uri) else {
-        ocsf_emit!(denied: true, build_forward_parse_error_ocsf_event(
+        egress_emit!(build_forward_parse_error_ocsf_event(
             workload_peer_addr,
             method,
             &telemetry_path
@@ -5458,7 +5517,7 @@ async fn handle_forward_proxy(
 
     if scheme != "http" {
         let event = build_forward_unsupported_scheme_ocsf_event(method, &scheme, &host_lc, port);
-        ocsf_emit!(event);
+        egress_emit!(event);
         if scheme == "https" {
             respond(
                 client,
@@ -5550,7 +5609,7 @@ async fn handle_forward_proxy(
     let matched_policy = match &decision.action {
         NetworkAction::Allow { matched_policy } => matched_policy.clone(),
         NetworkAction::Deny { reason } => {
-            ocsf_emit!(parent: &connect_span, build_forward_policy_deny_ocsf_event(
+            egress_emit!(deny_parent: &connect_span, build_forward_policy_deny_ocsf_event(
                 workload_addr,
                 method,
                 &host_lc,
@@ -5661,16 +5720,12 @@ async fn handle_forward_proxy(
     let prepared_target = match prepare_forward_target(&path, canonicalize_options) {
         Ok(prepared) => prepared,
         Err(error) => {
-            let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                .activity(ActivityId::Fail)
-                .severity(SeverityId::Medium)
-                .status(StatusId::Failure)
-                .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                .message(format!(
-                    "FORWARD rejecting non-canonical request-target: {error}"
-                ))
-                .build();
-            ocsf_emit!(parent: &connect_span, event);
+            let event = build_forward_rejection_event(
+                &host_lc,
+                port,
+                format!("FORWARD rejecting non-canonical request-target: {error}"),
+            );
+            egress_emit!(deny_parent: &connect_span, event);
             emit_activity_simple(activity_tx, true, "forward_parse_rejection");
             respond(
                 client,
@@ -5823,7 +5878,7 @@ async fn handle_forward_proxy(
         if !l7_config.config.allow_encoded_slash
             && crate::l7::path::canonical_path_has_encoded_slash(&path)
         {
-            ocsf_emit!(parent: &connect_span, build_forward_l7_parse_rejection_ocsf_event(
+            egress_emit!(deny_parent: &connect_span, build_forward_l7_parse_rejection_ocsf_event(
                 workload_addr,
                 method,
                 &host_lc,
@@ -5880,7 +5935,7 @@ async fn handle_forward_proxy(
                 ))
                 .status_detail(upgrade_detail)
                 .build();
-            ocsf_emit!(parent: &connect_span, event);
+            egress_emit!(deny_parent: &connect_span, event);
             emit_activity_simple(activity_tx, true, "l7_parse_rejection");
             emit_denial_simple(
                 denial_tx,
@@ -5938,14 +5993,12 @@ async fn handle_forward_proxy(
             {
                 Ok(info) => info,
                 Err(e) => {
-                    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                        .activity(ActivityId::Fail)
-                        .severity(SeverityId::Medium)
-                        .status(StatusId::Failure)
-                        .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                        .message(format!("FORWARD_GRAPHQL_L7 request rejected: {e}"))
-                        .build();
-                    ocsf_emit!(parent: &connect_span, denied: true, event);
+                    let event = build_forward_rejection_event(
+                        &host_lc,
+                        port,
+                        format!("FORWARD_GRAPHQL_L7 request rejected: {e}"),
+                    );
+                    egress_emit!(deny_parent: &connect_span, event);
                     emit_activity_simple(activity_tx, true, "l7_parse_rejection");
                     respond(
                         client,
@@ -5992,14 +6045,12 @@ async fn handle_forward_proxy(
                 {
                     Ok(body) => body,
                     Err(e) => {
-                        let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                            .activity(ActivityId::Fail)
-                            .severity(SeverityId::Medium)
-                            .status(StatusId::Failure)
-                            .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                            .message(format!("FORWARD_JSONRPC_L7 request rejected: {e}"))
-                            .build();
-                        ocsf_emit!(parent: &connect_span, denied: true, event);
+                        let event = build_forward_rejection_event(
+                            &host_lc,
+                            port,
+                            format!("FORWARD_JSONRPC_L7 request rejected: {e}"),
+                        );
+                        egress_emit!(deny_parent: &connect_span, event);
                         emit_activity_simple(activity_tx, true, "l7_parse_rejection");
                         respond(
                             client,
@@ -6050,18 +6101,17 @@ async fn handle_forward_proxy(
         let hard_deny_reason =
             crate::l7::relay::l7_request_hard_deny_reason(l7_config.config.protocol, &request_info);
         let force_deny = hard_deny_reason.is_some();
+        let mut evaluation_error = None;
         let (allowed, reason) = hard_deny_reason.map_or_else(
             || {
                 crate::l7::relay::evaluate_l7_request(&tunnel_engine, &l7_ctx, &request_info)
                     .unwrap_or_else(|e| {
-                        let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                            .activity(ActivityId::Fail)
-                            .severity(SeverityId::Low)
-                            .status(StatusId::Failure)
-                            .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                            .message(format!("L7 eval failed, denying request: {e}"))
-                            .build();
-                        ocsf_emit!(parent: &connect_span, denied: true, event);
+                        evaluation_error = Some(build_forward_l7_evaluation_error(
+                            &host_lc,
+                            port,
+                            l7_config.config.enforcement,
+                            &e.to_string(),
+                        ));
                         (false, format!("L7 evaluation error: {e}"))
                     })
             },
@@ -6137,7 +6187,7 @@ async fn handle_forward_proxy(
                 .firewall_rule(policy_str, engine_type)
                 .message(log_message)
                 .build();
-            ocsf_emit!(parent: &connect_span, event);
+            emit_forward_l7_decision(event, evaluation_error, &connect_span);
         }
 
         let effectively_denied = force_deny
@@ -6648,7 +6698,7 @@ async fn handle_forward_proxy(
                     "FORWARD upstream connect failed for {host_lc}:{port}: {e}"
                 ))
                 .build();
-            ocsf_emit!(parent: &connect_span, event);
+            egress_emit!(deny_parent: &connect_span, event);
             if let Some(session) = middleware_session.take() {
                 session
                     .end(openshell_core::proto::MiddlewareSessionEndReason::UpstreamFailure)
@@ -6778,7 +6828,7 @@ async fn handle_forward_proxy(
     // The request has now survived middleware, token grant, credential
     // rewriting, generation checks, and the HTTP relay. Only now record the
     // final allowed outcome.
-    ocsf_emit!(build_forward_allow_ocsf_event(
+    egress_emit!(build_forward_allow_ocsf_event(
         workload_addr,
         method,
         &host_lc,

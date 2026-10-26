@@ -13,7 +13,7 @@ use crate::objects::{AiModel, Container, Device, Metadata};
 /// Every event class embeds this struct via `#[serde(flatten)]`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct BaseEventData {
-    /// Trusted trace correlation (Trace profile).
+    /// Optional trace correlation from the OCSF producer (Trace profile).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace: Option<crate::TraceCorrelation>,
 
@@ -208,7 +208,7 @@ impl BaseEventData {
         self.ai_model = Some(ai_model);
     }
 
-    /// Set explicit trusted trace correlation and add the Trace profile once.
+    /// Set explicit trace correlation and add the Trace profile once.
     pub fn set_trace(&mut self, trace: crate::TraceCorrelation) {
         self.trace = Some(trace);
         if !self

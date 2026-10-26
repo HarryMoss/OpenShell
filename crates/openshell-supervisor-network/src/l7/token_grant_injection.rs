@@ -28,7 +28,7 @@ use tracing::warn;
 
 use crate::l7::provider::L7Request;
 use crate::l7::relay::L7EvalContext;
-use crate::telemetry::ocsf_emit;
+use crate::telemetry::egress_emit;
 
 /// Borrowed grant configuration for one endpoint-bound provider credential.
 pub struct TokenGrantRequest<'a> {
@@ -341,7 +341,7 @@ fn report_refused_grant(
             .map_or_else(|| "none".to_string(), |status| status.to_string()),
         "Token grant failed"
     );
-    ocsf_emit!(
+    egress_emit!(
         HttpActivityBuilder::new(ocsf_ctx())
             .activity(ActivityId::Fail)
             .action(ActionId::Denied)
@@ -399,7 +399,7 @@ async fn inject_selected(
             inject_header(&raw_header, &name, &value).map_err(TokenGrantInjectionError::new)?;
     }
     for (provider_key, _) in credentials {
-        ocsf_emit!(
+        egress_emit!(
             HttpActivityBuilder::new(ocsf_ctx())
                 .activity(ActivityId::Other)
                 .action(ActionId::Allowed)

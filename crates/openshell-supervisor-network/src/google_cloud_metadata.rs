@@ -15,9 +15,11 @@
 use http::StatusCode;
 use miette::{IntoDiagnostic, Result};
 use openshell_core::provider_credentials::ProviderCredentialState;
-use openshell_ocsf::{ActivityId, HttpActivityBuilder, HttpRequest, SeverityId, StatusId};
+use openshell_ocsf::{
+    ActionId, ActivityId, DispositionId, HttpActivityBuilder, HttpRequest, SeverityId, StatusId,
+};
 
-use crate::telemetry::ocsf_emit;
+use crate::telemetry::egress_emit;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 type MetadataResponse = (u16, &'static str, String);
@@ -311,7 +313,7 @@ fn emit_metadata_event(
     status: StatusId,
     message: &str,
 ) {
-    ocsf_emit!(denied: matches!(response_code, 403 | 405), build_metadata_event(
+    egress_emit!(build_metadata_event(
         method,
         response_code,
         severity,
@@ -327,7 +329,7 @@ fn build_metadata_event(
     status: StatusId,
     message: &str,
 ) -> openshell_ocsf::OcsfEvent {
-    HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+    let mut builder = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
         .activity(ActivityId::for_http_method(method))
         .http_request(HttpRequest {
             http_method: method.parse().expect("HTTP method parsing is infallible"),
@@ -338,8 +340,13 @@ fn build_metadata_event(
         })
         .severity(severity)
         .status(status)
-        .message(message.to_string())
-        .build()
+        .message(message.to_string());
+    if matches!(response_code, 403 | 405) {
+        builder = builder
+            .action(ActionId::Denied)
+            .disposition(DispositionId::Blocked);
+    }
+    builder.build()
 }
 
 #[cfg(test)]

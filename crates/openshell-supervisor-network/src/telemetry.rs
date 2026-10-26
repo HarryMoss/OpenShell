@@ -5,46 +5,93 @@
 
 use openshell_ocsf::{ActionId, OcsfEvent};
 
-/// Emit network events inside an INFO deny span when their action or explicit
-/// decision is denied. A saved connect span can supply the parent after
-/// authorization exits; a disabled DEBUG parent leaves the deny as a root.
-macro_rules! ocsf_emit {
+/// Emit egress events inside an INFO deny span. `denied:` supplies the decision
+/// for findings without an action; domain events carry their own action.
+/// A saved connect span parents denies after authorization exits.
+macro_rules! egress_emit {
     ($event:expr) => {
         $crate::telemetry::emit($event, None, false)
     };
-    (parent: $parent:expr, $event:expr) => {
+    (deny_parent: $parent:expr, $event:expr) => {
         $crate::telemetry::emit($event, Some($parent), false)
     };
-    (parent: $parent:expr, denied: $denied:expr, $event:expr) => {{
+    (deny_parent: $parent:expr, denied: $denied:expr, $event:expr) => {{
+        // Evaluate the decision before moving the event it may inspect.
         let denied = $denied;
         $crate::telemetry::emit($event, Some($parent), denied)
     }};
-    (optional_parent: $parent:expr, $event:expr) => {
+    (optional_deny_parent: $parent:expr, $event:expr) => {
         $crate::telemetry::emit($event, $parent, false)
     };
     (denied: $denied:expr, $event:expr) => {{
+        // Evaluate the decision before moving the event it may inspect.
         let denied = $denied;
         $crate::telemetry::emit($event, None, denied)
     }};
 }
-pub(crate) use ocsf_emit;
+pub(crate) use egress_emit;
+
+fn is_denied(event: &OcsfEvent) -> bool {
+    match event {
+        OcsfEvent::NetworkActivity(event) => event.action == Some(ActionId::Denied),
+        OcsfEvent::HttpActivity(event) => event.action == Some(ActionId::Denied),
+        OcsfEvent::DetectionFinding(event) => event.action == Some(ActionId::Denied),
+        _ => false,
+    }
+}
 
 pub fn emit(event: OcsfEvent, parent: Option<&tracing::Span>, denied: bool) {
-    let (action, endpoint, policy) = match &event {
-        OcsfEvent::NetworkActivity(e) => {
-            (e.action, e.dst_endpoint.as_ref(), e.firewall_rule.as_ref())
-        }
-        OcsfEvent::HttpActivity(e) => (e.action, e.dst_endpoint.as_ref(), e.firewall_rule.as_ref()),
-        OcsfEvent::DetectionFinding(e) => (e.action, None, None),
-        _ => (None, None, None),
-    };
-    if !denied && action != Some(ActionId::Denied) {
+    if !denied && !is_denied(&event) {
         openshell_ocsf::ocsf_emit!(event);
         return;
     }
+    let span = deny_span(&event, parent);
+    span.in_scope(|| openshell_ocsf::ocsf_emit!(event));
+}
+
+/// Emit all records of one synchronous decision under one deny span. Different
+/// decisions remain separate, even when they concern the same connection.
+pub fn emit_decision(
+    events: impl IntoIterator<Item = OcsfEvent>,
+    parent: Option<&tracing::Span>,
+    denied: bool,
+) {
+    let events: Vec<_> = events.into_iter().collect();
+    let primary = events
+        .iter()
+        .find(|event| is_denied(event))
+        .or_else(|| if denied { events.first() } else { None });
+    let span = primary.map(|event| deny_span(event, parent));
+    let emit = || {
+        for event in events {
+            openshell_ocsf::ocsf_emit!(event);
+        }
+    };
+    if let Some(span) = span {
+        span.in_scope(emit);
+    } else {
+        emit();
+    }
+}
+
+/// Build a decision scope, reusing an active deny scope for its companion
+/// records rather than creating another exported span.
+pub fn deny_span(event: &OcsfEvent, parent: Option<&tracing::Span>) -> tracing::Span {
+    let current = tracing::Span::current();
+    if current
+        .metadata()
+        .is_some_and(|metadata| metadata.name() == "supervisor.egress.deny")
+    {
+        return current;
+    }
+    let (endpoint, policy) = match event {
+        OcsfEvent::NetworkActivity(e) => (e.dst_endpoint.as_ref(), e.firewall_rule.as_ref()),
+        OcsfEvent::HttpActivity(e) => (e.dst_endpoint.as_ref(), e.firewall_rule.as_ref()),
+        _ => (None, None),
+    };
 
     // Finding evidence supplies decision fields, not a trace parent.
-    let evidence = |key: &str| match &event {
+    let evidence = |key: &str| match event {
         OcsfEvent::DetectionFinding(e) => e.evidences.as_ref().and_then(|items| {
             items
                 .iter()
@@ -69,7 +116,7 @@ pub fn emit(event: OcsfEvent, parent: Option<&tracing::Span>, denied: bool) {
         openshell.policy.reason = tracing::field::Empty,
         server.address = tracing::field::Empty,
         server.port = tracing::field::Empty,
-        ocsf.class_uid = event.class_uid(),
+        ocsf.class_uid = i64::from(event.class_uid()),
     );
     if let Some(policy) = policy {
         span.record("openshell.policy.name", policy);
@@ -83,7 +130,7 @@ pub fn emit(event: OcsfEvent, parent: Option<&tracing::Span>, denied: bool) {
     if let Some(port) = port {
         span.record("server.port", i64::from(port));
     }
-    span.in_scope(|| openshell_ocsf::ocsf_emit!(event));
+    span
 }
 
 #[cfg(test)]
